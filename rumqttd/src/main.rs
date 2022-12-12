@@ -1,10 +1,11 @@
+use std::io::Write;
+
+use config::FileFormat;
 use rumqttd::Broker;
 
-use simplelog::{
-    Color, ColorChoice, CombinedLogger, Level, LevelFilter, LevelPadding, TargetPadding,
-    TermLogger, TerminalMode, ThreadPadding,
-};
 use structopt::StructOpt;
+
+pub static RUMQTTD_DEFAULT_CONFIG: &str = include_str!("../rumqttd.toml");
 
 #[derive(StructOpt)]
 #[structopt(name = "rumqttd")]
@@ -25,59 +26,80 @@ struct CommandLine {
     commit_date: String,
     /// path to config file
     #[structopt(short, long)]
-    config: String,
+    config: Option<String>,
+    #[structopt(subcommand)]
+    command: Option<Command>,
     /// log level (v: info, vv: debug, vvv: trace)
     #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
     verbose: u8,
 }
 
+#[derive(StructOpt)]
+enum Command {
+    /// Write default configuration file to stdout
+    GenerateConfig,
+}
+
 fn main() {
     let commandline: CommandLine = CommandLine::from_args();
 
+    if let Some(Command::GenerateConfig) = commandline.command {
+        std::io::stdout()
+            .write_all(RUMQTTD_DEFAULT_CONFIG.as_bytes())
+            .unwrap();
+        std::process::exit(0);
+    }
+
     banner(&commandline);
-    initialize_logging(&commandline);
-
-    let config = config::Config::builder()
-        .add_source(config::File::with_name(&commandline.config))
-        .build()
-        .unwrap();
-
-    let config = config.try_deserialize().unwrap();
-
-    println!("{:#?}", config);
-
-    let mut broker = Broker::new(config);
-    broker.start().unwrap();
-}
-
-fn initialize_logging(commandline: &CommandLine) {
-    let mut config = simplelog::ConfigBuilder::new();
-
     let level = match commandline.verbose {
-        0 => LevelFilter::Warn,
-        1 => LevelFilter::Info,
-        2 => LevelFilter::Debug,
-        _ => LevelFilter::Trace,
+        0 => "rumqttd=warn",
+        1 => "rumqttd=info",
+        2 => "rumqttd=debug",
+        _ => "rumqttd=trace",
     };
 
-    config
-        .set_location_level(LevelFilter::Off)
-        .set_target_level(LevelFilter::Error)
-        .set_target_padding(TargetPadding::Right(25))
-        .set_thread_level(LevelFilter::Error)
-        .set_thread_padding(ThreadPadding::Right(2))
-        .set_level_color(Level::Trace, Some(Color::Cyan))
-        .set_level_padding(LevelPadding::Right);
+    // tracing syntac ->
+    let builder = tracing_subscriber::fmt()
+        .pretty()
+        .with_line_number(false)
+        .with_file(false)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_env_filter(level)
+        .with_filter_reloading();
 
-    config.add_filter_allow_str("rumqttd");
+    let reload_handle = builder.reload_handle();
 
-    let loggers = TermLogger::new(
-        level,
-        config.build(),
-        TerminalMode::Mixed,
-        ColorChoice::Always,
-    );
-    CombinedLogger::init(vec![loggers]).unwrap();
+    builder
+        .try_init()
+        .expect("initialized subscriber succesfully");
+
+    let mut configs: rumqttd::Config;
+    if let Some(config) = &commandline.config {
+        configs = config::Config::builder()
+            .add_source(config::File::with_name(config))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+    } else {
+        configs = config::Config::builder()
+            .add_source(config::File::from_str(
+                RUMQTTD_DEFAULT_CONFIG,
+                FileFormat::Toml,
+            ))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+    }
+
+    configs.console.set_filter_reload_handle(reload_handle);
+
+    // println!("{:#?}", config);
+
+    let mut broker = Broker::new(configs);
+    broker.start().unwrap();
 }
 
 fn banner(commandline: &CommandLine) {
